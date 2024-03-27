@@ -1,47 +1,83 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use clipboard_rs::{
+    Clipboard, ClipboardContext, ClipboardHandler, ClipboardWatcher, ClipboardWatcherContext,
+    WatcherShutdown,
+};
 use std::{sync::Mutex, thread};
+use tauri::{AppHandle, Manager};
 
-use clipboard_rs::{Clipboard, ClipboardContext, ClipboardWatcher, ClipboardWatcherContext};
-use tauri::Manager;
+struct ClipboardManager {
+    ctx: ClipboardContext,
+    app: AppHandle,
+}
 
-// Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+impl ClipboardManager {
+    pub fn new(app: AppHandle) -> Self {
+        let ctx = ClipboardContext::new().unwrap();
+        ClipboardManager { ctx, app }
+    }
+}
+
+impl ClipboardHandler for ClipboardManager {
+    fn on_clipboard_change(&mut self) {
+        let _ = self
+            .app
+            .emit_all("clipboard_change", Some(self.ctx.get_text().unwrap()));
+    }
 }
 
 struct MyState {
-  clipboard_ctx: std::sync::Mutex<ClipboardContext>,
-}
-// remember to call `.manage(MyState::default())`
-#[tauri::command]
-async fn read(state: tauri::State<'_, MyState>) -> Result<String, String> {
-  let res = state.clipboard_ctx.lock().unwrap().get_text();
-  Ok(res.unwrap())
+    ctx: ClipboardContext,
+    stop_channel: Mutex<Option<WatcherShutdown>>,
 }
 
 #[tauri::command]
-async fn watch(   app: tauri::AppHandle) -> Result<(), String> {
-    let mut wathcer = ClipboardWatcherContext::new().unwrap();
-    wathcer.add_handler(Box::new(move||{
-        println!("clipboard change");
-        let _=app.emit_all("clipboard-change", true);
-    }));
-    thread::spawn(move||{
-        wathcer.start_watch();
+async fn read(state: tauri::State<'_, MyState>) -> Result<String, String> {
+    let res = state.ctx.get_text();
+    Ok(res.unwrap_or("".to_string()))
+}
+
+#[tauri::command]
+async fn watch(app: tauri::AppHandle, state: tauri::State<'_, MyState>) -> Result<(), String> {
+    let mut stop_channel = state.stop_channel.lock().expect("lock failed");
+    if stop_channel.is_some() {
+        println!("watcher already started");
+        return Err("watcher already started".to_string());
+    }
+    // 你也可以只使用这个 watcher，这个 watcher 会在剪贴板变动时回调你，我这只是一个简单的 demo，你可以丰富你的 manager 去做更多事情
+    let manager = ClipboardManager::new(app);
+    let mut watcher = ClipboardWatcherContext::new().expect("watcher init failed");
+    let shutdown_channel = watcher.add_handler(manager).get_shutdown_channel();
+    stop_channel.replace(shutdown_channel);
+    thread::spawn(move || {
+        println!("start watch");
+        watcher.start_watch();
     });
-  Ok(())
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_watch(state: tauri::State<'_, MyState>) -> Result<(), String> {
+    // state.stop_channel.lock().unwrap().take().unwrap().stop();
+    let mut shutdown_channel = state.stop_channel.lock().expect("lock failed");
+    if let Some(shutdown_channel) = shutdown_channel.take() {
+        println!("stop watch");
+        shutdown_channel.stop();
+    }
+    Ok(())
 }
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![greet,read,watch])
-        .setup(|app|{
-            let ctx = ClipboardContext::new().unwrap();
-            app.manage(MyState{
-                clipboard_ctx:Mutex::new(ctx)
+        .invoke_handler(tauri::generate_handler![read, watch, stop_watch])
+        .setup(|app| {
+            // 你可以只使用这个 ctx，在你觉得想要使用的时候使用
+            let ctx = ClipboardContext::new().expect("clipboard init failed");
+            app.manage(MyState {
+                ctx,
+                stop_channel: Mutex::new(None),
             });
             return Ok(());
         })
